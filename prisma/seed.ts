@@ -3,6 +3,16 @@ import { PrismaClient } from '@prisma/client'
 const prisma = new PrismaClient()
 
 async function main() {
+  // Check if sample data already exists
+  const existingSubmissionCount = await prisma.submission.count();
+
+  if (existingSubmissionCount > 0) {
+    console.log(`Found ${existingSubmissionCount} existing submissions. Skipping sample data creation.`);
+    return;
+  }
+
+  console.log('No existing data found. Creating sample data...');
+
   // Create sample users
   const user1 = await prisma.user.upsert({
     where: { email: 'zhang.san@university.edu' },
@@ -31,6 +41,26 @@ async function main() {
       email: 'wang.wu@university.edu',
       name: '王五',
       studentId: '2021003'
+    },
+  })
+
+  const user4 = await prisma.user.upsert({
+    where: { email: 'zhao.liu@university.edu' },
+    update: {},
+    create: {
+      email: 'zhao.liu@university.edu',
+      name: '赵六',
+      studentId: '2021004'
+    },
+  })
+
+  const user5 = await prisma.user.upsert({
+    where: { email: 'qian.qi@university.edu' },
+    update: {},
+    create: {
+      email: 'qian.qi@university.edu',
+      name: '钱七',
+      studentId: '2021005'
     },
   })
 
@@ -95,7 +125,7 @@ async function main() {
       abstract: '本文研究了BERT模型在中文情感分析任务上的表现，并提出了一种结合领域自适应的改进方法。通过在多个中文情感数据集上的实验，证明了我们方法的有效性。',
       keywords: '自然语言处理, 情感分析, BERT, 领域自适应',
       voteCount: 18,
-      authorId: user3.id,
+      authorId: user4.id,
     },
   })
 
@@ -112,7 +142,7 @@ async function main() {
       abstract: '本研究开发了一个基于增强现实技术的交互式学习平台，主要面向K12教育。通过将抽象概念可视化，学生可以更直观地理解复杂知识点。系统支持多学科内容，包括数学、物理、化学等。',
       keywords: '增强现实, 教育技术, 交互式学习, K12教育',
       voteCount: 31,
-      authorId: user1.id,
+      authorId: user5.id,
     },
   })
 
@@ -131,7 +161,7 @@ async function main() {
     ],
   })
 
-  console.log('Sample data created successfully!')
+  console.log(`Sample data created successfully! Created 5 submissions with sample users and votes.`);
 }
 
 main()
