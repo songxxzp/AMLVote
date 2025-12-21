@@ -1,0 +1,534 @@
+import json
+import traceback
+import os
+import random
+import argparse
+import requests
+import copy
+import sys
+import math
+import warnings
+
+import torch
+import numpy as np
+import torchvision.transforms as T
+
+from typing import Callable, List, Dict, Any, Optional
+from functools import partial
+
+from tqdm import tqdm
+from PIL import Image
+from transformers import AutoModel, AutoTokenizer
+from torchvision.transforms.functional import InterpolationMode
+from decord import VideoReader, cpu    # pip install decord
+from transformers import Qwen2VLForConditionalGeneration, AutoTokenizer, AutoProcessor
+from qwen_vl_utils import process_vision_info
+
+# pip install git+https://github.com/LLaVA-VL/LLaVA-NeXT.git
+try:
+    from llava.model.builder import load_pretrained_model
+    from llava.mm_utils import get_model_name_from_path, process_images, tokenizer_image_token
+    from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IGNORE_INDEX
+    from llava.conversation import conv_templates, SeparatorStyle
+except:
+    pass
+
+warnings.filterwarnings("ignore")
+
+
+def load_data(data_dirs, save_paths=[], max_video_per_set=65536) -> List[str]:
+    if isinstance(data_dirs, str):
+        video_dirs = json.load(open(data_dirs))
+    else:
+        video_dirs = data_dirs
+    video_paths = []
+    saved_files = []
+    for save_path in save_paths:
+        if os.path.exists(save_path):
+            print(f"save_path: {save_path}")
+            saved_files += [os.path.basename(json.loads(l)["video"]) for l in open(save_path)]
+
+    print(f"len(saved_files): {len(saved_files)}")
+
+    for video_dir in video_dirs:
+        subset_video_paths = []
+        if os.path.isfile(video_dir):
+            if os.path.exists(video_dir):
+                subset_video_paths.append(video_dir)
+            else:
+                print(f"Not exists: {video_dir}")
+        else:
+            for video_file in os.listdir(video_dir):
+                subset_video_paths.append(os.path.join(video_dir, video_file))
+        video_paths += [video_file for video_file in random.Random(42).sample(subset_video_paths, k=min(max_video_per_set, len(subset_video_paths))) if os.path.basename(video_file) not in saved_files]
+    return video_paths
+
+
+@torch.inference_mode()
+def caption_qwen2_vl(video_path, args, model, processor) -> Dict[str, Any]:
+    torch.cuda.empty_cache()
+    prompt = args.prompt or "Describe this video."
+    max_pixels = args.max_pixels or 360 * 420
+    fps = args.fps or 1.0
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "video",
+                    "video": video_path,
+                    "max_pixels": max_pixels,
+                    "fps": fps,
+                },
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
+
+    # Preparation for inference
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs = inputs.to("cuda")
+    torch.cuda.empty_cache()
+    # Inference
+    generated_ids = model.generate(**inputs, use_cache=True, max_new_tokens=4096)
+    generated_ids_trimmed = [
+        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    answer = processor.batch_decode(
+        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )
+    inputs = inputs.to('cpu')
+    caption_result = {
+        "video": video_path,
+        "max_pixels": max_pixels,
+        "fps": fps,
+        "question": prompt,
+        "answer": answer,
+    }
+    return caption_result
+
+
+def encode_video_minicpm_v(
+        video_path,
+        MAX_NUM_FRAMES=64 # if cuda OOM set a smaller number
+):
+    def uniform_sample(l, n):
+        gap = len(l) / n
+        idxs = [int(i * gap + gap / 2) for i in range(n)]
+        return [l[i] for i in idxs]
+
+    vr = VideoReader(video_path, ctx=cpu(0))
+    sample_fps = round(vr.get_avg_fps() / 1)  # FPS
+    frame_idx = [i for i in range(0, len(vr), sample_fps)]
+    if len(frame_idx) > MAX_NUM_FRAMES:
+        frame_idx = uniform_sample(frame_idx, MAX_NUM_FRAMES)
+    frames = vr.get_batch(frame_idx).asnumpy()
+    frames = [Image.fromarray(v.astype('uint8')) for v in frames]
+    print('num frames:', len(frames))
+    return frames
+
+
+def caption_minicpm_v(video_path, model, tokenizer) -> Dict[str, Any]:
+    frames = encode_video_minicpm_v(video_path)
+    question = "Describe the video"
+    msgs = [
+        {'role': 'user', 'content': frames + [question]}, 
+    ]
+
+    # Set decode params for video
+    params={}
+    params["use_image_id"] = False
+    # print(f"frames[0]: {frames[0].size}")
+    if frames[0].size[0] > 448 or frames[0].size[1] > 448:
+        params["max_slice_nums"] = 1
+    else:
+        params["max_slice_nums"] = 2 # use 1 if cuda OOM and video resolution >  448*448
+
+    answer = model.chat(
+        image=None,
+        msgs=msgs,
+        tokenizer=tokenizer,
+        **params
+    )
+    caption_result = {
+        "video": video_path,
+        "frames": len(frames),
+        "question": question,
+        "answer": answer,
+    }
+    return caption_result
+
+
+def load_video(video_path, max_frames_num, fps=1, force_sample=False):
+    if max_frames_num == 0:
+        return np.zeros((1, 336, 336, 3))
+    vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
+    total_frame_num = len(vr)
+    video_time = total_frame_num / vr.get_avg_fps()
+    fps = round(vr.get_avg_fps()/fps)
+    frame_idx = [i for i in range(0, len(vr), fps)]
+    frame_time = [i/fps for i in frame_idx]
+    if len(frame_idx) > max_frames_num or force_sample:
+        sample_fps = max_frames_num
+        uniform_sampled_frames = np.linspace(0, total_frame_num - 1, sample_fps, dtype=int)
+        frame_idx = uniform_sampled_frames.tolist()
+        frame_time = [i/vr.get_avg_fps() for i in frame_idx]
+    frame_time = ",".join([f"{i:.2f}s" for i in frame_time])
+    spare_frames = vr.get_batch(frame_idx).asnumpy()
+    # import pdb;pdb.set_trace()
+
+    return spare_frames,frame_time,video_time
+
+
+def caption_llava_next_qwen(video_path, model, tokenizer, image_processor, device='cuda') -> str:
+    max_frames_num = 64
+    video,frame_time,video_time = load_video(video_path, max_frames_num, 1, force_sample=True)
+    # print(video)
+    # input()
+    video = [frame for frame in video]
+    video = image_processor.preprocess(video, return_tensors="pt")["pixel_values"].cuda().bfloat16()
+    conv_template = "qwen_1_5"  # Make sure you use correct chat template for different models
+    question = DEFAULT_IMAGE_TOKEN + "\nPlease describe this video in detail."
+    conv = copy.deepcopy(conv_templates[conv_template])
+    conv.append_message(conv.roles[0], question)
+    conv.append_message(conv.roles[1], None)
+    prompt_question = conv.get_prompt()
+    input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
+    cont = model.generate(
+        input_ids,
+        images=video,
+        # modalities="video",
+        do_sample=False,
+        temperature=0.01,
+        max_new_tokens=4096,
+        use_cache=True,
+    )
+    text_outputs = tokenizer.batch_decode(cont, skip_special_tokens=True)
+    
+    caption_result = {
+        "video": video_path,
+        "frame_time": frame_time,
+        "video_time": video_time,
+        "question": question,
+        "answer": text_outputs,
+    }
+    return caption_result
+
+
+def caption_internvl_40b(video_path, model, tokenizer):
+    IMAGENET_MEAN = (0.485, 0.456, 0.406)
+    IMAGENET_STD = (0.229, 0.224, 0.225)
+
+    def build_transform(input_size):
+        MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
+        transform = T.Compose([
+            T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+            T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize(mean=MEAN, std=STD)
+        ])
+        return transform
+
+    def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
+        best_ratio_diff = float('inf')
+        best_ratio = (1, 1)
+        area = width * height
+        for ratio in target_ratios:
+            target_aspect_ratio = ratio[0] / ratio[1]
+            ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+            if ratio_diff < best_ratio_diff:
+                best_ratio_diff = ratio_diff
+                best_ratio = ratio
+            elif ratio_diff == best_ratio_diff:
+                if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                    best_ratio = ratio
+        return best_ratio
+
+    def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbnail=False):
+        orig_width, orig_height = image.size
+        aspect_ratio = orig_width / orig_height
+
+        # calculate the existing image aspect ratio
+        target_ratios = set(
+            (i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1) if
+            i * j <= max_num and i * j >= min_num)
+        target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+        # find the closest aspect ratio to the target
+        target_aspect_ratio = find_closest_aspect_ratio(
+            aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+
+        # calculate the target width and height
+        target_width = image_size * target_aspect_ratio[0]
+        target_height = image_size * target_aspect_ratio[1]
+        blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+        # resize the image
+        resized_img = image.resize((target_width, target_height))
+        processed_images = []
+        for i in range(blocks):
+            box = (
+                (i % (target_width // image_size)) * image_size,
+                (i // (target_width // image_size)) * image_size,
+                ((i % (target_width // image_size)) + 1) * image_size,
+                ((i // (target_width // image_size)) + 1) * image_size
+            )
+            # split the image
+            split_img = resized_img.crop(box)
+            processed_images.append(split_img)
+        assert len(processed_images) == blocks
+        if use_thumbnail and len(processed_images) != 1:
+            thumbnail_img = image.resize((image_size, image_size))
+            processed_images.append(thumbnail_img)
+        return processed_images
+
+    def load_image(image_file, input_size=448, max_num=12):
+        image = Image.open(image_file).convert('RGB')
+        transform = build_transform(input_size=input_size)
+        images = dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
+        pixel_values = [transform(image) for image in images]
+        pixel_values = torch.stack(pixel_values)
+        return pixel_values
+
+    # video multi-round conversation (视频多轮对话)
+    def get_index(bound, fps, max_frame, first_idx=0, num_segments=32):
+        if bound:
+            start, end = bound[0], bound[1]
+        else:
+            start, end = -100000, 100000
+        start_idx = max(first_idx, round(start * fps))
+        end_idx = min(round(end * fps), max_frame)
+        seg_size = float(end_idx - start_idx) / num_segments
+        frame_indices = np.array([
+            int(start_idx + (seg_size / 2) + np.round(seg_size * idx))
+            for idx in range(num_segments)
+        ])
+        return frame_indices
+
+    def load_video(video_path, bound=None, input_size=448, max_num=1, num_segments=32):
+        vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
+        max_frame = len(vr) - 1
+        fps = float(vr.get_avg_fps())
+
+        pixel_values_list, num_patches_list = [], []
+        transform = build_transform(input_size=input_size)
+        frame_indices = get_index(bound, fps, max_frame, first_idx=0, num_segments=num_segments)
+        for frame_index in frame_indices:
+            img = Image.fromarray(vr[frame_index].asnumpy()).convert('RGB')
+            img = dynamic_preprocess(img, image_size=input_size, use_thumbnail=True, max_num=max_num)
+            pixel_values = [transform(tile) for tile in img]
+            pixel_values = torch.stack(pixel_values)
+            num_patches_list.append(pixel_values.shape[0])
+            pixel_values_list.append(pixel_values)
+        pixel_values = torch.cat(pixel_values_list)
+        return pixel_values, num_patches_list
+
+    generation_config = dict(max_new_tokens=4096, do_sample=True)
+    pixel_values, num_patches_list = load_video(video_path, num_segments=8, max_num=1)
+    pixel_values = pixel_values.to(torch.bfloat16)
+    video_prefix = ''.join([f'Frame{i+1}: <image>\n' for i in range(len(num_patches_list))])
+
+    question = video_prefix + 'Describe this video in detail. Don\'t repeat.'
+    response, history = model.chat(tokenizer, pixel_values, question, generation_config,
+                                num_patches_list=num_patches_list, history=None, return_history=True)
+
+    caption_result = {
+        "video": video_path,
+        "max_new_tokens": 4096,
+        "num_segments": 8,
+        "max_num": 1,
+        "question": question,
+        "answer": response,
+    }
+    return caption_result
+
+
+def caption_internlm_xcomposer2d5_7b(video_path, model, tokenizer):
+
+    query = 'Here are some frames of a video. Describe this video in detail'
+    image = [video_path]
+    with torch.autocast(device_type='cuda', dtype=torch.float16):
+        # response, his = model.chat(tokenizer, query, image, do_sample=True, use_meta=True, use_cache=True, max_new_tokens=4096)
+        response, his = model.chat(tokenizer, query, image, do_sample=False, num_beams=3, use_meta=True, use_cache=True, max_new_tokens=4096)
+    print(response)
+
+    caption_result = {
+        "video": video_path,
+        "max_new_tokens": 4096,
+        "num_beams": 3,
+        "question": query,
+        "answer": response,
+    }
+    return caption_result
+
+
+@torch.inference_mode()
+def get_caption_func(args, model_name: str) -> Callable:
+    model_dirs = ["/workspace/xixuan/model", "/workspace/mm_data/checkpoints/"]
+    if model_name in ["InternVL2-40B-Official"]:
+        model_path = "/workspace/mm_data/checkpoints/InternVL2-40B"
+    else:
+        for model_dir in model_dirs:
+            if os.path.exists(os.path.join(model_dir, model_name)):
+                break
+        if os.path.exists(model_name):
+            model_path = model_name
+        elif os.path.exists(os.path.join(model_dir, model_name)):
+            model_path = os.path.join(model_dir, model_name)
+    print(f"model_path: {model_path}")
+    if model_name in ["Qwen2-VL-7B-Instruct", "Qwen2-VL-2B-Instruct"] or "qwen" in model_path.lower():
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16, attn_implementation='flash_attention_2'
+        ).eval().to(torch.bfloat16).cuda()  #  , device_map="auto"
+        processor = AutoProcessor.from_pretrained(model_path)
+        caption = partial(caption_qwen2_vl, args=args, model=model, processor=processor)
+    elif model_name in ["MiniCPM-V-2_6"]:
+        model = AutoModel.from_pretrained(model_path, trust_remote_code=True, attn_implementation='spda', torch_dtype=torch.bfloat16).eval().cuda() # sdpa or flash_attention_2, no eager
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        caption = partial(caption_minicpm_v, model=model, tokenizer=tokenizer)
+    elif model_name in ["LLaVA-NeXT-Video-7B-Qwen2", "LLaVA-NeXT-Video-72B-Qwen2"]:
+        device_map = "auto"
+        tokenizer, model, image_processor, max_length = load_pretrained_model(model_path, None, "llava_qwen", attn_implementation="sdpa", device_map=device_map)  # Add any other thing you want to pass in llava_model_args
+        model.eval()
+        # if isinstance(model.config["text_config"], dict):
+        #     model.config["text_config"] = argparse.Namespace(**model.config["text_config"])
+        argparse
+        model.tie_weights()
+        caption = partial(caption_llava_next_qwen, model=model, tokenizer=tokenizer, image_processor=image_processor)
+    elif model_name in ["InternVL2-40B-Official"]:
+        def split_model(model_name):
+            device_map = {}
+            world_size = torch.cuda.device_count()
+            num_layers = {
+                'InternVL2-1B': 24, 'InternVL2-2B': 24, 'InternVL2-4B': 32, 'InternVL2-8B': 32,
+                'InternVL2-26B': 48, 'InternVL2-40B': 60, 'InternVL2-Llama3-76B': 80}[model_name]
+            # Since the first GPU will be used for ViT, treat it as half a GPU.
+            num_layers_per_gpu = math.ceil(num_layers / (world_size - 0.5))
+            num_layers_per_gpu = [num_layers_per_gpu] * world_size
+            num_layers_per_gpu[0] = math.ceil(num_layers_per_gpu[0] * 0.5)
+            layer_cnt = 0
+            for i, num_layer in enumerate(num_layers_per_gpu):
+                for j in range(num_layer):
+                    device_map[f'language_model.model.layers.{layer_cnt}'] = i
+                    layer_cnt += 1
+            device_map['vision_model'] = 0
+            device_map['mlp1'] = 0
+            device_map['language_model.model.tok_embeddings'] = 0
+            device_map['language_model.model.embed_tokens'] = 0
+            device_map['language_model.output'] = 0
+            device_map['language_model.model.norm'] = 0
+            device_map['language_model.lm_head'] = 0
+            device_map[f'language_model.model.layers.{num_layers - 1}'] = 0
+
+            return device_map
+
+        @torch .no_grad()
+        def rot_embed_forward_fix(self, x, position_ids):
+            if "dynamic" in self.rope_type:
+                self._dynamic_frequency_update(position_ids, device=x.device)
+
+            # Core RoPE block
+            inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device) # FIX
+            position_ids_expanded = position_ids[:, None, :].float()
+            # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
+            device_type = x.device.type
+            device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+            with torch.autocast(device_type=device_type, enabled=False):
+                freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+                emb = torch.cat((freqs, freqs), dim=-1)
+                cos = emb.cos()
+                sin = emb.sin()
+
+            # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
+            cos = cos * self.attention_scaling
+            sin = sin * self.attention_scaling
+
+            return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+        device_map = split_model('InternVL2-40B')
+        model = AutoModel.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            load_in_8bit=False,
+            use_flash_attn=False,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            device_map=device_map).eval()
+        model.language_model.model.rotary_emb.__class__.forward = rot_embed_forward_fix 
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
+
+        caption = partial(caption_internvl_40b, model=model, tokenizer=tokenizer)
+    elif model_name in ["internlm-xcomposer2d5-7b"]:
+        torch.set_grad_enabled(False)
+        model = AutoModel.from_pretrained(model_path, attn_implementation='eager', torch_dtype=torch.bfloat16, trust_remote_code=True).cuda().eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model.tokenizer = tokenizer
+        model.config.attn_implementation = "eager"
+        caption = partial(caption_internlm_xcomposer2d5_7b, model=model, tokenizer=tokenizer)
+    else:
+        raise NotImplementedError(f"{model_name}")
+    return caption
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--worldsize', type=int, default=1)
+    parser.add_argument('--rank', type=int, default=0)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--model-names', nargs='+', type=str)
+    parser.add_argument('--data-path', type=str, default="/workspace/mm_data/video_caption_reward_model/captions/video_dirs.json")
+    parser.add_argument('--save-path', type=str, default=None)
+    parser.add_argument('--num-captions', type=int, default=1)
+    parser.add_argument('--prompt', type=str, default=None)
+    parser.add_argument('--max-pixels', type=int, default=None)
+    parser.add_argument('--fps', type=float, default=None)
+    args = parser.parse_args()
+
+    model_names = args.model_names  # ["LLaVA-NeXT-Video-72B-Qwen2"]  # "MiniCPM-V-2_6", "Qwen2-VL-2B-Instruct", "Qwen2-VL-7B-Instruct"
+    for model_name in model_names:
+        if args.save_path is None:
+            if args.worldsize == 1:
+                save_path = os.path.join("captions", f"{model_name}.jsonl")
+                save_paths = [save_path] + [os.path.join("captions", f"{model_name}_{r}.jsonl") for r in range(max(args.worldsize, 8))]
+            else:
+                save_path = os.path.join("captions", f"{model_name}_{args.rank}.jsonl")
+                save_paths = [os.path.join("captions", f"{model_name}.jsonl")] + [os.path.join("captions", f"{model_name}_{r}.jsonl") for r in range(max(args.worldsize, 8))]
+        else:
+            save_path = args.save_path
+            save_paths = [save_path]
+
+        video_paths = load_data(args.data_path, save_paths, max_video_per_set=65536)
+        video_paths = [video_path for video_path in video_paths for _ in range(args.num_captions)]
+        print(video_paths[:10])
+        # random.Random(args.seed).shuffle(video_paths)
+        chunk_size = len(video_paths) // args.worldsize
+        local_video_paths = video_paths[chunk_size * args.rank : chunk_size * (args.rank + 1)]
+        if len(local_video_paths) == 0:
+            continue
+        caption_func = get_caption_func(args, model_name)
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, 'a') as f:
+            for video_path in tqdm(local_video_paths):
+                try:
+                    caption_result = None
+                    caption_result = caption_func(video_path)
+                    print(caption_result)
+                    if caption_result is not None:
+                        f.write(json.dumps(caption_result) + '\n')
+                        f.flush()
+                    torch.cuda.empty_cache()
+                except KeyboardInterrupt:
+                    break
+                except:
+                    traceback.print_exc()
+                    pass

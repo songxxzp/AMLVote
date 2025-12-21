@@ -1,0 +1,71 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  studentId String?  @unique
+  avatar    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  submissions Submission[]
+  votes       Vote[]
+}
+
+model Submission {
+  id          String      @id @default(cuid())
+  title       String
+  description String?
+  type        SubmissionType @default(PAPER)
+  fileUrl     String?
+  fileName    String?
+  fileSize    Int?
+  authorName  String
+  authorEmail String
+  authorStudentId String?
+  coAuthors   String?
+  coAuthorStudentIds String?
+  abstract    String?
+  keywords    String?
+  voteCount   Int         @default(0)
+  isPresented Boolean     @default(false)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  
+  author   User   @relation(fields: [authorId], references: [id])
+  authorId String
+  votes    Vote[]
+}
+
+model Vote {
+  id           String   @id @default(cuid())
+  voterId      String
+  voterStudentId String?
+  submissionId String
+  createdAt    DateTime @default(now())
+  
+  voter      User       @relation(fields: [voterId], references: [id])
+  submission  Submission @relation(fields: [submissionId], references: [id])
+  
+  @@unique([voterId, submissionId])
+}
+
+enum SubmissionType {
+  PAPER
+  POSTER
+  DEMO
+}
