@@ -3,8 +3,34 @@ setlocal enabledelayedexpansion
 
 REM 检查参数
 set ADD_DEMO=false
-if "%1"=="--demo" set ADD_DEMO=true
-if "%1"=="-d" set ADD_DEMO=true
+set PORT=443
+
+REM 解析参数
+:parse_args
+if "%~1"=="" goto end_parse
+if "%~1"=="--demo" (
+    set ADD_DEMO=true
+)
+if "%~1"=="-d" (
+    set ADD_DEMO=true
+)
+if "%~1"=="--port" (
+    shift
+    set PORT=%~1
+)
+echo %~1 | findstr /C:"--port=" >nul
+if !errorlevel! equ 0 (
+    for /f "tokens=2 delims==" %%a in ("%~1") do set PORT=%%a
+)
+echo %~1 | findstr /C:"-p" >nul
+if !errorlevel! equ 0 (
+    set PORT=%~1
+    set PORT=!PORT:-p=!
+)
+shift
+goto parse_args
+
+:end_parse
 
 echo 🚀 启动学术作品投票平台...
 
@@ -64,15 +90,16 @@ if "%ADD_DEMO%"=="true" (
 
 REM 启动服务
 echo 🌐 启动服务...
-echo ✅ 应用将在 http://localhost:3000 启动
-echo 🌐 中文版: http://localhost:3000/zh/
-echo 🌐 英文版: http://localhost:3000/en/
+echo ✅ 应用将在 http://localhost:!PORT! 启动
+echo 🌐 中文版: http://localhost:!PORT!/zh/
+echo 🌐 英文版: http://localhost:!PORT!/en/
 echo.
 echo 💡 提示:
 echo    - 启动时添加演示数据: start.bat --demo
+echo    - 指定端口: start.bat --port 3000 或 start.bat -p3000
 echo    - 清理数据库: clean-db.bat --help
 echo 📝 查看日志: type dev.log
 echo 🛑 停止服务: Ctrl+C
 echo.
 
-bun run dev
+bun run dev -- -p !PORT!

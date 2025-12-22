@@ -2,10 +2,15 @@
 
 # 检查参数
 ADD_DEMO=false
+PORT=443  # 默认端口
+
 for arg in "$@"; do
     if [ "$arg" = "--demo" ] || [ "$arg" = "-d" ]; then
         ADD_DEMO=true
-        break
+    elif [[ "$arg" =~ ^--port=[0-9]+$ ]]; then
+        PORT="${arg#--port=}"
+    elif [[ "$arg" =~ ^-p[0-9]+$ ]]; then
+        PORT="${arg#-p}"
     fi
 done
 
@@ -69,15 +74,16 @@ fi
 
 # 启动服务
 echo "🌐 启动服务..."
-echo "✅ 应用将在 http://localhost:3000 启动"
-echo "🌐 中文版: http://localhost:3000/zh/"
-echo "🌐 英文版: http://localhost:3000/en/"
+echo "✅ 应用将在 http://localhost:$PORT 启动"
+echo "🌐 中文版: http://localhost:$PORT/zh/"
+echo "🌐 英文版: http://localhost:$PORT/en/"
 echo ""
 echo "💡 提示:"
 echo "   - 启动时添加演示数据: ./start.sh --demo"
+echo "   - 指定端口: ./start.sh --port=3000 或 ./start.sh -p3000"
 echo "   - 清理数据库: ./clean-db.sh --help"
 echo "📝 查看日志: tail -f dev.log"
 echo "🛑 停止服务: Ctrl+C"
 echo ""
 
-bun run dev
+NEXT_PORT=$PORT bun run dev
