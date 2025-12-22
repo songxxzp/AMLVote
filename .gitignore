@@ -106,3 +106,22 @@ checkpoints/
 outputs/
 results/
 logs/
+
+# Database files
+db/custom.db
+db/*.db
+prisma/db/
+db/backup/
+
+# Lock files
+bun.lock
+*.lock
+
+# Temporary log files (named by port numbers)
+[0-9]*
+[0-9][0-9]*
+[0-9][0-9][0-9]*
+[0-9][0-9][0-9][0-9]*
+
+# Setup scripts that generate content
+setup.sh
