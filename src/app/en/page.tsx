@@ -45,6 +45,7 @@ export default function EnglishPage() {
   const [showVoterDialog, setShowVoterDialog] = useState(false)
   const [pendingVoteId, setPendingVoteId] = useState<string | null>(null)
   const [remainingVotes, setRemainingVotes] = useState(5)
+  const [expandedCards, setExpandedCards] = useState<Set<string>>(new Set())
 
   // Form states
   const [formData, setFormData] = useState({
@@ -294,6 +295,20 @@ export default function EnglishPage() {
       default: return 'bg-gray-100 text-gray-800'
     }
   }
+
+  const toggleCardExpansion = (submissionId: string) => {
+    setExpandedCards(prev => {
+      const newSet = new Set(prev)
+      if (newSet.has(submissionId)) {
+        newSet.delete(submissionId)
+      } else {
+        newSet.add(submissionId)
+      }
+      return newSet
+    })
+  }
+
+  const isExpanded = (submissionId: string) => expandedCards.has(submissionId)
 
   if (loading) {
     return (
@@ -554,7 +569,7 @@ export default function EnglishPage() {
             {/* Submissions Grid */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
               {filteredSubmissions.map((submission) => (
-                <Card key={submission.id} className="hover:shadow-lg transition-shadow">
+                <Card key={submission.id} className="hover:shadow-lg transition-shadow flex flex-col">
                   <CardHeader>
                     <div className="flex justify-between items-start mb-2">
                       <CardTitle className="text-lg line-clamp-2">{submission.title}</CardTitle>
@@ -566,11 +581,38 @@ export default function EnglishPage() {
                         </span>
                       </Badge>
                     </div>
-                    <CardDescription className="line-clamp-3">
-                      {submission.description}
-                    </CardDescription>
+
+                    {/* Abstract section */}
+                    {submission.abstract && (
+                      <div className="mb-3">
+                        <div className="text-sm font-medium text-gray-700 mb-1">Abstract:</div>
+                        <div className={`text-sm text-gray-600 ${isExpanded(submission.id) ? '' : 'line-clamp-3'}`}>
+                          {submission.abstract}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Description section */}
+                    {submission.description && (
+                      <div className="mb-2">
+                        <div className="text-sm font-medium text-gray-700 mb-1">Description:</div>
+                        <div className={`text-sm text-gray-600 ${isExpanded(submission.id) ? '' : 'line-clamp-2'}`}>
+                          {submission.description}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Expand/Collapse button */}
+                    {(submission.abstract || submission.description) && (
+                      <button
+                        onClick={() => toggleCardExpansion(submission.id)}
+                        className="text-sm text-blue-600 hover:text-blue-800 mt-1 focus:outline-none"
+                      >
+                        {isExpanded(submission.id) ? 'Collapse ▲' : 'Expand more ▼'}
+                      </button>
+                    )}
                   </CardHeader>
-                  <CardContent>
+                  <CardContent className="flex-grow">
                     <div className="space-y-3">
                       <div className="flex items-center text-sm text-gray-600">
                         <span className="font-medium">Author:</span>
