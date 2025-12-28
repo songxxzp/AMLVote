@@ -474,9 +474,12 @@ export default function EnglishPage() {
                       <Input
                         id="file"
                         type="file"
-                        accept=".pdf,.doc,.docx,.ppt,.pptx"
+                        accept=".pdf,.doc,.docx,.ppt,.pptx,.mp4,.avi,.mov,.wmv,.webm,.mkv,.m4v"
                         onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
                       />
+                      <p className="text-xs text-gray-500">
+                        Supports documents (PDF, DOC, PPT) and videos (MP4, AVI, MOV, WMV, WEBM, MKV, M4V), max 100MB
+                      </p>
                     </div>
                   </div>
                   <div className="flex justify-end space-x-2">
