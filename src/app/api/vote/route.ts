@@ -14,11 +14,19 @@ export async function POST(request: NextRequest) {
     }
 
     // Find or create voter
+    // First, try to find by studentId
     let voter = await db.user.findFirst({
       where: { studentId: voterStudentId }
     });
 
-    if (!voter) {
+    // If found, update the voter's name
+    if (voter) {
+      voter = await db.user.update({
+        where: { id: voter.id },
+        data: { name: voterName }
+      });
+    } else {
+      // If not found by studentId, create new voter with placeholder email
       voter = await db.user.create({
         data: {
           email: `${voterStudentId}@student.edu`, // Generate placeholder email

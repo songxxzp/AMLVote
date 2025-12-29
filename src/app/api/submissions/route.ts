@@ -55,10 +55,30 @@ export async function POST(request: NextRequest) {
     } = body;
 
     // Create or find user
+    // First, try to find by email
     let user = await db.user.findUnique({
       where: { email: authorEmail }
     });
 
+    // If not found by email and studentId is provided, try to find by studentId
+    if (!user && authorStudentId) {
+      user = await db.user.findUnique({
+        where: { studentId: authorStudentId }
+      });
+
+      // If found by studentId, update email and name
+      if (user) {
+        user = await db.user.update({
+          where: { id: user.id },
+          data: {
+            email: authorEmail,
+            name: authorName
+          }
+        });
+      }
+    }
+
+    // If still not found, create new user
     if (!user) {
       user = await db.user.create({
         data: {
